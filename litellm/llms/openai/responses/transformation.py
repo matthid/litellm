@@ -166,10 +166,27 @@ class OpenAIResponsesAPIConfig(BaseResponsesAPIConfig):
         # Convert the dictionary to a properly typed ResponsesAPIStreamingResponse
         verbose_logger.debug("Raw OpenAI Chunk=%s", parsed_chunk)
         event_type = str(parsed_chunk.get("type"))
+        # Flatten nested error object for error events
+        # OpenAI may send: {"type":"error", "error": {"code":..., "message":..., "param":...}}
+        if event_type == "error" or event_type == ResponsesAPIStreamEvents.ERROR:
+            nested_error = parsed_chunk.get("error")
+            if isinstance(nested_error, dict):
+                for k in ("code", "message", "param"):
+                    if k not in parsed_chunk and k in nested_error:
+                        parsed_chunk[k] = nested_error[k]
         event_pydantic_model = OpenAIResponsesAPIConfig.get_event_model_class(
             event_type=event_type
         )
-        return event_pydantic_model(**parsed_chunk)
+        try:
+            return event_pydantic_model(**parsed_chunk)
+        except Exception as e:
+            # Fallback to a permissive model to avoid breaking the stream
+            verbose_logger.debug(
+                "Failed to parse streaming event with %s due to %s; falling back to GenericEvent",
+                event_pydantic_model,
+                e,
+            )
+            return GenericEvent(**parsed_chunk)
 
     @staticmethod
     def get_event_model_class(event_type: str) -> Any:
