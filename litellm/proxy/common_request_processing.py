@@ -28,6 +28,9 @@ from litellm.constants import (
 from litellm.litellm_core_utils.dd_tracing import tracer
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
+from litellm.litellm_core_utils.llm_response_utils.get_headers import (
+    get_response_headers,
+)
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.auth.auth_utils import check_response_size_is_safe
 from litellm.proxy.common_utils.callback_utils import (
@@ -81,9 +84,22 @@ async def _parse_event_data_for_error(event_line: Union[str, bytes]) -> Optional
                 # Ensure error_code is a valid HTTP status code
                 if error_code is not None and 100 <= error_code <= 599:
                     return error_code
-                elif (
-                    error_code_raw is not None
-                ):  # Log if original code was present but not valid
+                # Map common string codes to HTTP status
+                if isinstance(error_code_raw, str):
+                    mapped = {
+                        "server_error": status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        "rate_limit_exceeded": status.HTTP_429_TOO_MANY_REQUESTS,
+                        "invalid_request_error": status.HTTP_400_BAD_REQUEST,
+                        "authentication_error": status.HTTP_401_UNAUTHORIZED,
+                        "insufficient_quota": status.HTTP_402_PAYMENT_REQUIRED,
+                        "not_found": status.HTTP_404_NOT_FOUND,
+                        "conflict": status.HTTP_409_CONFLICT,
+                        "timeout": status.HTTP_504_GATEWAY_TIMEOUT,
+                    }.get(str(error_code_raw).lower())
+                    if mapped is not None:
+                        return mapped
+                elif error_code_raw is not None:
+                    # Log if original code was present but not valid
                     verbose_proxy_logger.warning(
                         f"Error has invalid or non-convertible code: {error_code_raw}"
                     )
@@ -461,6 +477,17 @@ class ProxyBaseLLMRequestProcessing:
             response
         ):  # use generate_responses to stream responses
 
+            # Try to include provider response headers for streaming responses
+            try:
+                stream_response_headers = {}
+                httpx_response = getattr(response, "response", None)
+                if httpx_response is not None and hasattr(httpx_response, "headers"):
+                    stream_response_headers = get_response_headers(httpx_response.headers)
+            except Exception as e:
+                verbose_proxy_logger.debug(
+                    f"Could not extract streaming response headers: {e}"
+                )
+
             custom_headers = ProxyBaseLLMRequestProcessing.get_custom_headers(
                 user_api_key_dict=user_api_key_dict,
                 call_id=logging_obj.litellm_call_id,
@@ -473,7 +500,7 @@ class ProxyBaseLLMRequestProcessing:
                 fastest_response_batch_completion=fastest_response_batch_completion,
                 request_data=self.data,
                 hidden_params=hidden_params,
-                **additional_headers,
+                **{**additional_headers, **(stream_response_headers or {})},
             )
             if route_type == "allm_passthrough_route":
                 # Check if response is an async generator

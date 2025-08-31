@@ -3451,7 +3451,44 @@ async def async_data_generator(
                 response_str = litellm.get_response_string(response_obj=chunk)
                 str_so_far += response_str
 
-            if isinstance(chunk, BaseModel):
+            # Detect OpenAI Responses API error events and convert them to SSE error payloads
+            # This ensures proxy logs the failure and the client receives a consistent error chunk.
+            try:
+                from pydantic import BaseModel  # local import to avoid module-wide dependency
+                from litellm.types.llms.openai import ErrorEvent as _ResponsesErrorEvent
+            except Exception:
+                BaseModel = None  # type: ignore
+                _ResponsesErrorEvent = None  # type: ignore
+
+            if BaseModel is not None and isinstance(chunk, BaseModel):
+                # Handle explicit Responses API error events
+                if _ResponsesErrorEvent is not None and isinstance(chunk, _ResponsesErrorEvent):
+                    try:
+                        # Log failure via proxy callbacks
+                        proxy_exception = ProxyException(
+                            message=getattr(chunk, "message", "Streaming error"),
+                            type="server_error",
+                            param=getattr(chunk, "param", None),
+                            code=500,
+                        )
+                        await proxy_logging_obj.post_call_failure_hook(
+                            user_api_key_dict=user_api_key_dict,
+                            original_exception=proxy_exception,
+                            request_data=request_data,
+                        )
+                    finally:
+                        # Return an SSE-compatible error object
+                        _err_payload = {
+                            "error": {
+                                "message": getattr(chunk, "message", "Streaming error"),
+                                "code": getattr(chunk, "code", "server_error"),
+                                "param": getattr(chunk, "param", None),
+                            }
+                        }
+                        error_message = f"data: {json.dumps(_err_payload)}\n\n"
+                        break
+
+                # Normal pydantic chunk -> JSON string
                 chunk = chunk.model_dump_json(exclude_none=True, exclude_unset=True)
             elif isinstance(chunk, str) and chunk.startswith("data: "):
                 error_message = chunk
